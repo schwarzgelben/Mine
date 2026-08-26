@@ -1,6 +1,9 @@
 /**
- * Surge 策略组当前节点 Entry(入口) & Landing(落地) & ASN 链路检测
- * 支持多层嵌套策略组 (select / url-test / fallback / load-balance) 自动递归穿透解析
+ * Surge 策略组全节点 Entry(入口) & Landing(落地) & ASN 链路检测
+ * - 支持检测指定策略组下的【所有节点】（自动展开嵌套子策略组）
+ * - 精准入口解析：通过 DNS 解析服务器域名，并定向直连查询入口 IP 真实归属地
+ * - 精准落地检测：绑定各代理节点（policy）独立探测出口落地 IP、国旗与 AS 归属
+ * - 多任务并发与智能排错
  */
 
 (async () => {
@@ -8,81 +11,192 @@
   const targetGroup = args.group || "PROXY";
 
   try {
-    // 1. 递归解析策略组当前激活的实际节点
-    const resolved = await resolveActivePolicy(targetGroup);
+    // 1. 获取全量策略组配置信息
+    const allGroupsData = await httpApiGet("/v1/policy_groups");
+    const allGroupNames = extractGroupNames(allGroupsData);
 
-    if (!resolved || !resolved.finalNode) {
-      // 尝试获取当前所有策略组列表以提供精准提示
-      const allGroups = await getAllPolicyGroupNames();
-      const groupTip = allGroups.length > 0
-        ? `\n\n💡 可用策略组:\n${allGroups.slice(0, 8).join(", ")}${allGroups.length > 8 ? " 等" : ""}`
-        : "\n\n💡 请检查 Surge 是否在 [General] 中启用了 http-api";
+    // 2. 检查策略组是否存在
+    if (!allGroupsData || (!allGroupsData[targetGroup] && !allGroupNames.includes(targetGroup))) {
+      // 检查 targetGroup 是否可能直接是一个单独的节点
+      const singleDetail = await httpApiGet(`/v1/policies/detail?policy_name=${encodeURIComponent(targetGroup)}`);
+      if (!singleDetail || (!singleDetail.type && !singleDetail.server)) {
+        const groupTip = allGroupNames.length > 0
+          ? `\n\n💡 当前可用策略组:\n${allGroupNames.slice(0, 8).join(", ")}${allGroupNames.length > 8 ? " 等" : ""}`
+          : "\n\n💡 请检查 Surge 是否在 [General] 中启用了 http-api";
 
+        $done({
+          title: `${targetGroup} 链路检测`,
+          content: `❌ 未找到策略组 [${targetGroup}]${groupTip}`,
+          icon: "exclamationmark.triangle",
+          "icon-color": "#FF3B30"
+        });
+        return;
+      }
+    }
+
+    // 3. 获取当前策略组激活/选中的节点
+    const activeNodeName = await getActiveNodeForGroup(targetGroup, allGroupsData);
+
+    // 4. 获取该策略组下的所有底层实体节点列表
+    let nodeList = await getAllNodesInGroup(targetGroup, allGroupsData);
+
+    // 过滤掉内置无效策略（保留普通代理节点和 DIRECT）
+    nodeList = nodeList.filter((name) => {
+      const upper = name.toUpperCase();
+      return !upper.startsWith("REJECT") && upper !== "PASS";
+    });
+
+    if (nodeList.length === 0) {
       $done({
-        title: `${targetGroup} 链路状态`,
-        content: `❌ 未找到策略组 [${targetGroup}]${groupTip}`,
+        title: `${targetGroup} 链路检测`,
+        content: `策略组 [${targetGroup}] 下未找到可用代理节点`,
         icon: "exclamationmark.triangle",
-        "icon-color": "#FF3B30"
+        "icon-color": "#FF9500"
       });
       return;
     }
 
-    const { finalNode, chain } = resolved;
+    // 5. 并发检测所有节点（限制最大并发数为 4，保证速度且避免冲击 Surge API / 网络）
+    const results = await runWithConcurrency(nodeList, async (nodeName) => {
+      return await checkSingleNode(nodeName, nodeName === activeNodeName);
+    }, 4);
 
-    // 2. 并行获取：代理落地(Landing)信息、入口服务器解析(Server Entry)
-    const [landing, serverEntry] = await Promise.all([
-      fetchLandingInfo(),
-      fetchServerEntry(finalNode)
-    ]);
+    // 6. 统计检测结果
+    const totalCount = results.length;
+    const successCount = results.filter((r) => r.landing.success).length;
+    const failCount = totalCount - successCount;
 
-    // 3. 构建展示标题与内容
-    const flag = getFlagEmoji(landing.countryCode);
-    const chainDesc = chain.length > 1 ? ` (${chain.slice(1).join(" → ")})` : "";
+    // 7. 构建展示内容
+    let content = "";
+    if (totalCount === 1) {
+      // 单节点精细展示
+      const item = results[0];
+      const flag = getFlagEmoji(item.landing.countryCode);
+      const isActiveText = item.isActive ? " [当前激活]" : "";
+      content = [
+        `📍 节点: ${flag} ${item.name}${isActiveText} (⚡ ${item.landing.latency})`,
+        `🚪 入口: ${item.entry.desc}`,
+        `🌍 落地: ${item.landing.ip} ${flag} ${item.landing.location}`,
+        `🏢 归属: ${item.landing.asInfo}`
+      ].join("\n");
+    } else {
+      // 多节点列表化展示
+      const summaryHeader = `【${targetGroup}】共 ${totalCount} 个节点 (${successCount} 正常${failCount > 0 ? ` / ${failCount} 异常` : ""})\n`;
+      const nodeBlocks = results.map((item) => {
+        const flag = getFlagEmoji(item.landing.countryCode);
+        const activeMark = item.isActive ? "🌟" : "🔹";
+        const activeTag = item.isActive ? " [当前]" : "";
 
-    const lines = [
-      `📍 节点: ${flag} ${finalNode}${chainDesc}`,
-      `🚪 入口: ${serverEntry.desc}`,
-      `🌍 落地: ${landing.ip} ${flag} ${landing.location}`,
-      `🏢 归属: ${landing.asInfo}`
-    ];
+        if (item.landing.success) {
+          return [
+            `${activeMark} ${flag} ${item.name}${activeTag} ⚡ ${item.landing.latency}`,
+            `   🚪 入口: ${item.entry.desc}`,
+            `   🌍 落地: ${item.landing.ip} ${flag} ${item.landing.location} (${item.landing.asInfo})`
+          ].join("\n");
+        } else {
+          return [
+            `❌ ${item.name}${activeTag} (连接失败)`,
+            `   🚪 入口: ${item.entry.desc}`,
+            `   🌍 落地: 探测超时`
+          ].join("\n");
+        }
+      });
+
+      content = summaryHeader + "\n" + nodeBlocks.join("\n\n");
+    }
+
+    // 8. 设置图标状态颜色
+    let iconColor = "#34C759"; // 绿色
+    if (failCount > 0 && successCount > 0) {
+      iconColor = "#FF9500"; // 橙色部分异常
+    } else if (successCount === 0) {
+      iconColor = "#FF3B30"; // 红色全部失败
+    }
 
     $done({
-      title: `${targetGroup} 链路状态`,
-      content: lines.join("\n"),
+      title: `${targetGroup} 链路状态 (${successCount}/${totalCount})`,
+      content: content,
       icon: "network",
-      "icon-color": "#34C759"
+      "icon-color": iconColor
     });
   } catch (err) {
     $done({
       title: `${targetGroup} 检测异常`,
       content: `检测出错: ${err.message || err}`,
       icon: "exclamationmark.triangle",
-      "icon-color": "#FF9500"
+      "icon-color": "#FF3B30"
     });
   }
 })();
 
 /**
- * 递归解析策略组，支持多层嵌套 (如 PROXY -> Auto -> 香港 01)
+ * 检测单个节点的入口与落地信息
  */
-async function resolveActivePolicy(name, depth = 0, chain = []) {
-  if (depth > 6 || !name) return null;
-  const currentChain = [...chain, name];
+async function checkSingleNode(nodeName, isActive = false) {
+  // 并行获取该节点的入口服务器信息与落地出口信息
+  const [entry, landing] = await Promise.all([
+    fetchNodeEntryInfo(nodeName),
+    fetchNodeLandingInfo(nodeName)
+  ]);
 
-  // 1. 尝试直接作为 select 策略组查询
-  const selectRes = await httpApiGet(`/v1/policy_groups/select?group_name=${encodeURIComponent(name)}`);
-  if (selectRes && selectRes.policy) {
-    const nextPolicy = selectRes.policy;
-    // 递归检查该选中的 policy 是否仍是一个策略组
-    const deeper = await resolveActivePolicy(nextPolicy, depth + 1, currentChain);
-    if (deeper) return deeper;
-    return { finalNode: nextPolicy, chain: currentChain };
+  return {
+    name: nodeName,
+    isActive,
+    entry,
+    landing
+  };
+}
+
+/**
+ * 递归展开策略组，获取所有实体代理节点名称
+ */
+async function getAllNodesInGroup(groupName, allGroupsData, depth = 0) {
+  if (depth > 5 || !groupName) return [];
+  if (!allGroupsData || !allGroupsData[groupName]) {
+    return [groupName];
   }
 
-  // 2. 尝试从 test_results 查询 (url-test / fallback / load-balance 策略组)
+  const rawList = allGroupsData[groupName];
+  if (!Array.isArray(rawList)) return [groupName];
+
+  const result = [];
+  for (const item of rawList) {
+    const itemName = typeof item === "string" ? item : (item.name || item.policy);
+    if (!itemName) continue;
+
+    // 若子项仍为策略组，递归展开
+    if (allGroupsData[itemName] && depth < 4) {
+      const subNodes = await getAllNodesInGroup(itemName, allGroupsData, depth + 1);
+      result.push(...subNodes);
+    } else {
+      result.push(itemName);
+    }
+  }
+
+  // 去重并保持顺序
+  return Array.from(new Set(result));
+}
+
+/**
+ * 获取指定策略组当前激活/选中的节点
+ */
+async function getActiveNodeForGroup(groupName, allGroupsData, depth = 0) {
+  if (depth > 5 || !groupName) return null;
+
+  // 1. 尝试 select 策略组接口
+  const selectRes = await httpApiGet(`/v1/policy_groups/select?group_name=${encodeURIComponent(groupName)}`);
+  if (selectRes && selectRes.policy) {
+    const chosen = selectRes.policy;
+    if (allGroupsData && allGroupsData[chosen]) {
+      return getActiveNodeForGroup(chosen, allGroupsData, depth + 1);
+    }
+    return chosen;
+  }
+
+  // 2. 尝试 test_results 接口 (url-test / fallback / load-balance)
   const testRes = await httpApiGet("/v1/policy_groups/test_results");
-  if (testRes && testRes[name]) {
-    const groupResult = testRes[name];
+  if (testRes && testRes[groupName]) {
+    const groupResult = testRes[groupName];
     let winner = null;
     if (typeof groupResult === "string") {
       winner = groupResult;
@@ -91,154 +205,263 @@ async function resolveActivePolicy(name, depth = 0, chain = []) {
     } else if (groupResult.policy) {
       winner = groupResult.policy;
     } else if (Array.isArray(groupResult) && groupResult.length > 0) {
-      const winnerItem = groupResult.find((item) => item["is-winner"] || item.winner) || groupResult[0];
+      const winnerItem = groupResult.find((i) => i["is-winner"] || i.winner) || groupResult[0];
       winner = winnerItem.name || winnerItem.policy || winnerItem;
     }
-
     if (winner && typeof winner === "string") {
-      const deeper = await resolveActivePolicy(winner, depth + 1, currentChain);
-      if (deeper) return deeper;
-      return { finalNode: winner, chain: currentChain };
+      if (allGroupsData && allGroupsData[winner]) {
+        return getActiveNodeForGroup(winner, allGroupsData, depth + 1);
+      }
+      return winner;
     }
   }
 
-  // 3. 尝试从全量 policy_groups 中查找当前选中的选项
-  const allGroups = await httpApiGet("/v1/policy_groups");
-  if (allGroups && allGroups[name] && Array.isArray(allGroups[name])) {
-    const list = allGroups[name];
-    const selected = list.find((item) => item["is-selected"] || item.selected || item["is-winner"]);
-    const candidate = selected ? (selected.name || selected.policy) : (list[0]?.name || list[0]?.policy || list[0]);
+  // 3. 尝试 policy_groups 默认选中项
+  if (allGroupsData && allGroupsData[groupName] && Array.isArray(allGroupsData[groupName])) {
+    const list = allGroupsData[groupName];
+    const selected = list.find((i) => i["is-selected"] || i.selected || i["is-winner"]);
+    const candidate = selected ? (selected.name || selected.policy) : (list[0]?.name || list[0]?.policy);
     if (candidate && typeof candidate === "string") {
-      const deeper = await resolveActivePolicy(candidate, depth + 1, currentChain);
-      if (deeper) return deeper;
-      return { finalNode: candidate, chain: currentChain };
+      if (allGroupsData[candidate]) {
+        return getActiveNodeForGroup(candidate, allGroupsData, depth + 1);
+      }
+      return candidate;
     }
-  }
-
-  // 4. 检查它是否本身就是一个实体节点或内置策略
-  const detailRes = await httpApiGet(`/v1/policies/detail?policy_name=${encodeURIComponent(name)}`);
-  if (detailRes && (detailRes.type || detailRes.server || name.toUpperCase() === "DIRECT" || name.toUpperCase() === "REJECT")) {
-    return { finalNode: name, chain: chain.length > 0 ? chain : [name] };
   }
 
   return null;
 }
 
 /**
- * 获取所有策略组名称列表 (用于未找到时的友好提示)
+ * 内存缓存已解析过的入口 IP 地理位置，避免重复发起 DIRECT 查询
  */
-async function getAllPolicyGroupNames() {
-  try {
-    const res = await httpApiGet("/v1/policy_groups");
-    if (!res) return [];
-    if (Array.isArray(res["policy-groups"])) {
-      return res["policy-groups"];
-    }
-    return Object.keys(res).filter((k) => k !== "policy-groups" && Array.isArray(res[k]));
-  } catch {
-    return [];
-  }
-}
+const entryGeoCache = new Map();
 
 /**
- * 获取节点真实入口服务器信息
+ * 获取节点的真实入口信息（通过 policies/detail 获取 server，解析 DNS 并通过 DIRECT 查询入口归属）
  */
-async function fetchServerEntry(policyName) {
+async function fetchNodeEntryInfo(policyName) {
   if (!policyName) return { desc: "未知" };
 
   const upper = policyName.toUpperCase();
   if (upper === "DIRECT" || upper.startsWith("DIRECT-")) {
-    return { desc: "直连 (DIRECT)" };
-  }
-  if (upper === "REJECT" || upper.startsWith("REJECT-")) {
-    return { desc: "拒绝连接 (REJECT)" };
+    return { ip: "直连", desc: "本地网络 (DIRECT)" };
   }
 
   const detail = await httpApiGet(`/v1/policies/detail?policy_name=${encodeURIComponent(policyName)}`);
-  if (!detail) {
-    return { desc: "内置/直连" };
+  if (!detail || !detail.server) {
+    return { ip: "内置/直连", desc: detail?.type || "DIRECT" };
   }
 
-  const type = detail.type || "Proxy";
-  const server = detail.server || "";
-  const port = detail.port ? `:${detail.port}` : "";
+  const serverHost = detail.server;
+  const portStr = detail.port ? `:${detail.port}` : "";
+  const typeStr = detail.type || "Proxy";
 
-  if (server) {
-    return { desc: `${server}${port} (${type})` };
+  // 解析入口真实 IP
+  let entryIp = null;
+  const isDirectIp = /^(\d{1,3}\.){3}\d{1,3}$/.test(serverHost) || serverHost.includes(":");
+  if (isDirectIp) {
+    entryIp = serverHost;
+  } else {
+    entryIp = await resolveDomainToIp(serverHost);
   }
 
-  return { desc: `${type}` };
+  if (!entryIp) {
+    // DNS 未能解析出 IP，直接展示域名
+    return {
+      ip: serverHost,
+      desc: `${serverHost}${portStr} (${typeStr})`
+    };
+  }
+
+  // 查询入口 IP 的地理位置与运营商
+  let locDesc = "";
+  if (entryGeoCache.has(entryIp)) {
+    locDesc = entryGeoCache.get(entryIp);
+  } else {
+    locDesc = await queryIpLocationDirect(entryIp);
+    entryGeoCache.set(entryIp, locDesc);
+  }
+
+  const descText = locDesc
+    ? `${entryIp}${portStr} (${locDesc})`
+    : `${entryIp}${portStr} (${typeStr})`;
+
+  return {
+    ip: entryIp,
+    desc: descText
+  };
 }
 
 /**
- * 获取落地出口 IP 与地理位置信息
+ * 使用 DIRECT 直连查询入口 IP 的物理位置与运营商
  */
-async function fetchLandingInfo() {
-  // 首选 ip-api.com (支持中文城市和详细 ASN)
+async function queryIpLocationDirect(ip) {
   try {
     const data = await httpRequest({
-      url: "http://ip-api.com/json?lang=zh-CN",
-      timeout: 5000
+      url: `http://ip-api.com/json/${encodeURIComponent(ip)}?lang=zh-CN`,
+      policy: "DIRECT",
+      timeout: 2500
     });
     const res = JSON.parse(data);
     if (res && res.status === "success") {
-      const locParts = [res.country, res.city].filter(Boolean);
-      return {
-        ip: res.query || "未知",
-        countryCode: res.countryCode || "",
-        location: locParts.join(" ") || "未知位置",
-        asInfo: res.as || res.org || res.isp || "-"
-      };
+      const locParts = [res.regionName || res.country, res.city].filter(Boolean);
+      let ispText = (res.isp || res.org || "").replace(/China |Telecom|Unicom|Mobile/gi, (m) => {
+        if (/telecom/i.test(m)) return "电信";
+        if (/unicom/i.test(m)) return "联通";
+        if (/mobile/i.test(m)) return "移动";
+        return "";
+      }).trim();
+      if (!ispText && res.as) {
+        ispText = res.as.replace(/^AS\d+\s*/i, "").slice(0, 10);
+      }
+      return `${locParts.join(" ")} ${ispText}`.trim();
     }
-  } catch (_) {
-    // 降级使用备用源
-  }
+  } catch (_) {}
+  return "";
+}
 
-  // 备用源 1: api.ip.sb
+/**
+ * 解析域名对应的 IP (通过直连 DoH / HttpDNS)
+ */
+async function resolveDomainToIp(domain) {
+  if (!domain) return null;
+
+  // 1. 阿里 DNS (DoH via DIRECT)
   try {
     const data = await httpRequest({
-      url: "https://api.ip.sb/geoip",
-      headers: { "User-Agent": "Mozilla/5.0" },
-      timeout: 5000
+      url: `https://dns.alidns.com/resolve?name=${encodeURIComponent(domain)}&type=1`,
+      policy: "DIRECT",
+      timeout: 2000
     });
+    const json = JSON.parse(data);
+    if (json && json.Answer && json.Answer.length > 0) {
+      const aRecord = json.Answer.find((r) => r.type === 1);
+      if (aRecord && aRecord.data) return aRecord.data;
+    }
+  } catch (_) {}
+
+  // 2. 腾讯 HttpDNS (via DIRECT)
+  try {
+    const data = await httpRequest({
+      url: `http://119.29.29.29/d?dn=${encodeURIComponent(domain)}`,
+      policy: "DIRECT",
+      timeout: 2000
+    });
+    if (data && data.includes(".")) {
+      const ips = data.split(";").map((i) => i.trim()).filter((ip) => /^(\d{1,3}\.){3}\d{1,3}$/.test(ip));
+      if (ips.length > 0) return ips[0];
+    }
+  } catch (_) {}
+
+  // 3. Cloudflare DoH (via DIRECT)
+  try {
+    const data = await httpRequest({
+      url: `https://1.1.1.1/dns-query?name=${encodeURIComponent(domain)}&type=A`,
+      headers: { accept: "application/dns-json" },
+      policy: "DIRECT",
+      timeout: 2000
+    });
+    const json = JSON.parse(data);
+    if (json && json.Answer && json.Answer.length > 0) {
+      const aRecord = json.Answer.find((r) => r.type === 1);
+      if (aRecord && aRecord.data) return aRecord.data;
+    }
+  } catch (_) {}
+
+  return null;
+}
+
+/**
+ * 精准获取指定节点的落地出口信息（强制通过 policy: nodeName 发送探测请求）
+ */
+async function fetchNodeLandingInfo(nodeName) {
+  const startTime = Date.now();
+
+  // 首选源: ip-api.com (指定 policy 发送)
+  try {
+    const data = await httpRequest({
+      url: "http://ip-api.com/json?lang=zh-CN",
+      policy: nodeName,
+      timeout: 4000
+    });
+    const latency = Date.now() - startTime;
     const res = JSON.parse(data);
-    if (res && res.ip) {
+    if (res && res.status === "success") {
       const locParts = [res.country, res.city].filter(Boolean);
-      const asText = res.asn ? `AS${res.asn} ${res.asn_organization || ""}` : (res.organization || "-");
+      const asOrg = (res.as || res.org || "").replace(/^AS\d+\s*/i, "").slice(0, 15);
       return {
-        ip: res.ip,
-        countryCode: res.country_code || "",
-        location: locParts.join(" ") || res.country_code || "未知位置",
-        asInfo: asText.trim() || "-"
+        success: true,
+        ip: res.query || "未知",
+        countryCode: res.countryCode || "",
+        location: locParts.join(" ") || res.country || "未知",
+        asInfo: asOrg || res.as || "-",
+        latency: `${latency}ms`
       };
     }
   } catch (_) {}
 
-  // 备用源 2: ipwho.is
+  // 备选源: api.ip.sb (指定 policy 发送)
   try {
     const data = await httpRequest({
-      url: "https://ipwho.is/?lang=zh-CN",
-      timeout: 5000
+      url: "https://api.ip.sb/geoip",
+      headers: { "User-Agent": "Mozilla/5.0" },
+      policy: nodeName,
+      timeout: 4000
     });
+    const latency = Date.now() - startTime;
     const res = JSON.parse(data);
-    if (res && res.success) {
+    if (res && res.ip) {
       const locParts = [res.country, res.city].filter(Boolean);
-      const asText = res.connection?.asn ? `AS${res.connection.asn} ${res.connection.org || ""}` : (res.connection?.isp || "-");
+      const asText = res.asn ? `AS${res.asn} ${(res.asn_organization || "").slice(0, 15)}` : (res.organization || "-");
       return {
+        success: true,
         ip: res.ip,
         countryCode: res.country_code || "",
-        location: locParts.join(" ") || "未知位置",
-        asInfo: asText.trim() || "-"
+        location: locParts.join(" ") || res.country_code || "未知",
+        asInfo: asText.trim() || "-",
+        latency: `${latency}ms`
       };
     }
   } catch (_) {}
 
   return {
-    ip: "检测超时",
+    success: false,
+    ip: "连接超时",
     countryCode: "",
-    location: "网络连接失败",
-    asInfo: "-"
+    location: "无法连接",
+    asInfo: "-",
+    latency: "超时"
   };
+}
+
+/**
+ * 并发控制执行器
+ */
+async function runWithConcurrency(items, fn, limit = 4) {
+  const results = new Array(items.length);
+  let currentIndex = 0;
+
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (currentIndex < items.length) {
+      const idx = currentIndex++;
+      results[idx] = await fn(items[idx], idx);
+    }
+  });
+
+  await Promise.all(workers);
+  return results;
+}
+
+/**
+ * 提取全量策略组名称列表
+ */
+function extractGroupNames(allGroupsData) {
+  if (!allGroupsData) return [];
+  if (Array.isArray(allGroupsData["policy-groups"])) {
+    return allGroupsData["policy-groups"];
+  }
+  return Object.keys(allGroupsData).filter((k) => k !== "policy-groups" && Array.isArray(allGroupsData[k]));
 }
 
 /**
