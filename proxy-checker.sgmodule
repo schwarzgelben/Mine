@@ -2,9 +2,10 @@
 #!desc=实时并发检测指定策略组下所有节点的入口 IP、落地 IP、国旗与 ASN 链路信息
 #!category=Network Info
 #!arguments=group:PROXY
-#!arguments-desc=group: 需要检测的策略组名称（例如：PROXY、节点选择、Auto 等）[Panel]
+#!arguments-desc=设置需要检测的策略组名称，例如 PROXY、节点选择、Auto。
 
+[Panel]
 Proxy LSP = title="Proxy LSP", content="点击刷新进行节点检测", style=info, script-name=proxy-lsp
 
 [Script]
-proxy-lsp = type=generic, script-path=https://raw.githubusercontent.com/schwarzgelben/Mine/main/proxy-lsp.js, timeout=60, argument="group=PROXY&landing=current&max=0"
+proxy-lsp = type=generic, script-path=https://raw.githubusercontent.com/schwarzgelben/Mine/main/proxy-lsp.js, timeout=60, argument="{{{group}}}"
